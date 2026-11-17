@@ -230,23 +230,52 @@
     return null;
   }
 
-  async function getModel(apiKey, { refresh = false } = {}) {
+  // Models that failed for this key (retired, not on the free plan, ...), skipped for a day.
+  function badModels() {
     const s = store.load();
-    if (s.modelOverride) return s.modelOverride;
-    if (!refresh && s.model && s.modelKey === apiKey.slice(-6) && Date.now() - (s.modelAt || 0) < CONFIG.modelCacheMs) {
-      return s.model;
-    }
-    let chosen = null;
+    const bad = s.badModels || {};
+    const now = Date.now();
+    Object.keys(bad).forEach((k) => { if (now - bad[k] > 24 * 60 * 60 * 1000) delete bad[k]; });
+    return bad;
+  }
+  function markBad(model) {
+    const bad = badModels();
+    bad[model] = Date.now();
+    store.save({ badModels: bad, model: "", modelAt: 0 });
+  }
+
+  // Returns models to try, best first.
+  async function getModels(apiKey) {
+    const s = store.load();
+    if (s.modelOverride) return [s.modelOverride];
+    const bad = badModels();
+    const cached = s.model && s.modelKey === apiKey.slice(-6) && Date.now() - (s.modelAt || 0) < CONFIG.modelCacheMs && !bad[s.model];
+    if (cached) return [s.model]; // no need to ask Google again this week
+    let names = [];
     try {
-      chosen = pickBestModel(await listModels(apiKey));
+      names = (await listModels(apiKey)).filter((n) => !bad[n]);
     } catch (e) {
       if (e.status === 400 || e.status === 401 || e.status === 403) throw e; // bad key: let the caller say so
       console.warn("[Manuel] Could not list models, using fallback alias.", e);
     }
-    chosen = chosen || CONFIG.fallbackModel;
-    store.save({ model: chosen, modelAt: Date.now(), modelKey: apiKey.slice(-6) });
-    updateModelLabel();
-    return chosen;
+    const ranked = [];
+    let pool = names.slice();
+    for (let i = 0; i < 4 && pool.length; i++) {
+      const next = pickBestModel(pool);
+      if (!next) break;
+      ranked.push(next);
+      pool = pool.filter((n) => n !== next);
+    }
+    if (!bad[CONFIG.fallbackModel]) ranked.push(CONFIG.fallbackModel);
+    return [...new Set(ranked)];
+  }
+
+  function rememberModel(apiKey, model) {
+    const s = store.load();
+    if (s.model !== model) {
+      store.save({ model, modelAt: Date.now(), modelKey: apiKey.slice(-6) });
+      updateModelLabel();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -277,7 +306,7 @@ ${manualAsText()}`;
       contents,
       generationConfig: {
         temperature: 0.2,
-        maxOutputTokens: 2048, // roomy, because newer models "think" before answering
+        maxOutputTokens: 8192, // roomy, because newer models "think" before answering
         responseMimeType: "application/json",
         responseSchema: {
           type: "OBJECT",
@@ -288,7 +317,16 @@ ${manualAsText()}`;
     };
   }
 
-  async function callGemini(apiKey, model, body) {
+  // Ask the model to think only briefly: quicker answers, and its thinking can't
+  // use up the whole answer allowance. Each model family takes a different setting.
+  function thinkingFor(model) {
+    if (/^gemini-2\.5-flash/.test(model)) return { thinkingBudget: 0 };
+    if (/^gemini-2\.5-pro/.test(model)) return { thinkingBudget: 128 };
+    if (/^gemini-[3-9]/.test(model)) return { thinkingLevel: "low" };
+    return null;
+  }
+
+  async function postGenerate(apiKey, model, body) {
     const res = await fetch(`${CONFIG.apiBase}/models/${encodeURIComponent(model)}:generateContent`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
@@ -296,22 +334,51 @@ ${manualAsText()}`;
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const e = new Error(data?.error?.message || res.statusText);
+      const e = new Error(data?.error?.message || res.statusText || `HTTP ${res.status}`);
       e.status = res.status;
       throw e;
     }
-    const text = (data?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
-    if (!text) throw Object.assign(new Error("Empty answer"), { status: 0 });
+    return data;
+  }
+
+  async function callGemini(apiKey, model, baseBody) {
+    const thinking = thinkingFor(model);
+    let body = baseBody;
+    if (thinking) body = { ...baseBody, generationConfig: { ...baseBody.generationConfig, thinkingConfig: thinking } };
+    let data;
     try {
-      const parsed = JSON.parse(text);
+      data = await postGenerate(apiKey, model, body);
+    } catch (e) {
+      // If this model doesn't accept the thinking or JSON settings, try once with plain settings.
+      if (e.status !== 400 || /api key/i.test(e.message)) throw e;
+      console.warn(`[Manuel] ${model} refused the request settings, retrying plainly:`, e.message);
+      const { thinkingConfig, responseMimeType, responseSchema, ...plain } = baseBody.generationConfig;
+      data = await postGenerate(apiKey, model, { ...baseBody, generationConfig: plain });
+    }
+
+    const cand = data?.candidates?.[0];
+    const text = (cand?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("").trim();
+    if (!text) {
+      const why = data?.promptFeedback?.blockReason || cand?.finishReason || "no text";
+      throw Object.assign(new Error(`Gemini sent an empty answer (${why})`), { status: 0 });
+    }
+    try {
+      const parsed = JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ""));
       return { answer: String(parsed.answer || "").trim(), sectionId: parsed.sectionId || "" };
     } catch (_) {
       return { answer: text.replace(/[*#`_]/g, ""), sectionId: "" };
     }
   }
 
-  function looksLikeRetiredModel(e) {
-    return e.status === 404 || /not found|not supported|no longer|deprecated|retired/i.test(e.message || "");
+  // Errors that mean "this model won't work for you, try another one".
+  function modelProblem(e) {
+    return e.status === 404 ||
+      (e.status === 429 && /limit:\s*0\b|free.?tier|not available/i.test(e.message || "")) ||
+      /not found|not supported|no longer|deprecated|retired|not available|empty answer/i.test(e.message || "");
+  }
+
+  function keyProblem(e) {
+    return (e.status === 400 && /api key|api_key/i.test(e.message || "")) || e.status === 401 || e.status === 403;
   }
 
   async function ask(question) {
@@ -319,27 +386,44 @@ ${manualAsText()}`;
     if (!apiKey) return localAnswer(question);
 
     const body = buildRequest(question);
+    let lastError = null;
     try {
-      let model = await getModel(apiKey);
-      try {
-        return await callGemini(apiKey, model, body);
-      } catch (e) {
-        if (!looksLikeRetiredModel(e) || store.load().modelOverride) throw e;
-        console.warn(`[Manuel] Model "${model}" seems unavailable, choosing a new one.`, e.message);
-        model = await getModel(apiKey, { refresh: true });
-        return await callGemini(apiKey, model, body);
+      let models = await getModels(apiKey);
+      const tried = new Set();
+      while (models.length) {
+        const model = models.shift();
+        if (tried.has(model)) continue;
+        tried.add(model);
+        try {
+          const result = await callGemini(apiKey, model, body);
+          rememberModel(apiKey, model);
+          return result;
+        } catch (e) {
+          lastError = e;
+          console.warn(`[Manuel] ${model} failed:`, e.status, e.message);
+          if (keyProblem(e) || !modelProblem(e) || store.load().modelOverride) break;
+          markBad(model);
+          // The remembered model stopped working: ask Google for the current list.
+          if (!models.length && tried.size === 1) models = await getModels(apiKey);
+        }
       }
     } catch (e) {
-      console.error("[Manuel] Gemini error:", e);
-      const local = localAnswer(question);
-      if (e.status === 400 && /api key/i.test(e.message) || e.status === 401 || e.status === 403) {
-        return { answer: "Your Gemini key doesn't seem to work. Please check it in settings. " + local.answer, sectionId: local.sectionId };
-      }
-      if (e.status === 429) {
-        return { answer: "Gemini is busy right now, so here's what I found myself. " + local.answer, sectionId: local.sectionId };
-      }
-      return { answer: "I couldn't reach Gemini, so here's what I found myself. " + local.answer, sectionId: local.sectionId };
+      lastError = e;
     }
+
+    const e = lastError || new Error("No model available");
+    console.error("[Manuel] Gemini error:", e);
+    const local = localAnswer(question);
+    let lead;
+    if (keyProblem(e)) lead = "Your Gemini key doesn't seem to work. Please check it in settings.";
+    else if (e.status === 429) lead = "Gemini says the free limit is used up for now, so here's what I found myself.";
+    else if (e instanceof TypeError) lead = "I couldn't connect to Gemini. Please check your internet connection. Here's what I found myself.";
+    else lead = "Gemini had a problem, so here's what I found myself.";
+    return {
+      answer: lead + " " + local.answer,
+      sectionId: local.sectionId,
+      detail: `Gemini said: ${e.status ? e.status + " " : ""}${e.message}`,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -461,13 +545,15 @@ ${manualAsText()}`;
     if (spoken && text.split(/\s+/).length < 2) return afterTurn();
 
     stopListening();
+    showDetail("");
     setMode("thinking");
     showAnswer("Thinking…");
-    const { answer, sectionId } = await ask(text);
+    const { answer, sectionId, detail } = await ask(text);
     state.history.push({ q: text, a: answer });
     state.history = state.history.slice(-CONFIG.historyTurns);
     const section = state.sections.find((s) => s.id === sectionId);
     say(answer, section);
+    showDetail(detail);
   }
 
   function say(text, section) {
@@ -634,7 +720,7 @@ ${manualAsText()}`;
 .m-hint{font-size:12px;color:var(--m-mute)}
 #manuel-heard{font-size:13px;color:var(--m-mute);font-style:italic}
 #manuel-answer{background:var(--m-soft);border-radius:12px;padding:10px 12px;max-height:220px;overflow:auto;white-space:pre-wrap}
-#manuel-heard:empty,#manuel-answer:empty{display:none}
+#manuel-heard:empty,#manuel-answer:empty,#manuel-detail:empty{display:none}
 #manuel-goto{align-self:flex-start;background:transparent;border:1px solid var(--m-brand);color:var(--m-brand);border-radius:999px;padding:4px 12px;font:inherit;font-size:13px;cursor:pointer}
 #manuel-goto[hidden]{display:none}
 #manuel-form{display:flex;gap:8px}
@@ -686,6 +772,7 @@ ${manualAsText()}`;
     <div id="manuel-heard"></div>
     <div id="manuel-answer" aria-live="polite"></div>
     <button id="manuel-goto" hidden></button>
+    <div id="manuel-detail" class="m-note"></div>
     <form id="manuel-form" autocomplete="off">
       <input id="manuel-input" placeholder="Or type a question…" aria-label="Type a question"/>
       <button type="submit">Ask</button>
@@ -725,6 +812,8 @@ ${manualAsText()}`;
     $("manuel-mic").innerHTML = ICONS[m.icon];
     $("manuel-fab").innerHTML = ICONS[m.icon];
   }
+
+  function showDetail(text) { $("manuel-detail").textContent = text || ""; }
 
   function showHeard(text) { $("manuel-heard").textContent = text ? `“${text}”` : ""; }
 
