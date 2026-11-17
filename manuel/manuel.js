@@ -245,12 +245,12 @@
   }
 
   // Returns models to try, best first.
-  async function getModels(apiKey) {
+  async function getModels(apiKey, { fresh = false } = {}) {
     const s = store.load();
     if (s.modelOverride) return [s.modelOverride];
     const bad = badModels();
     const cached = s.model && s.modelKey === apiKey.slice(-6) && Date.now() - (s.modelAt || 0) < CONFIG.modelCacheMs && !bad[s.model];
-    if (cached) return [s.model]; // no need to ask Google again this week
+    if (cached && !fresh) return [s.model]; // no need to ask Google again this week
     let names = [];
     try {
       names = (await listModels(apiKey)).filter((n) => !bad[n]);
@@ -373,8 +373,13 @@ ${manualAsText()}`;
   // Errors that mean "this model won't work for you, try another one".
   function modelProblem(e) {
     return e.status === 404 ||
-      (e.status === 429 && /limit:\s*0\b|free.?tier|not available/i.test(e.message || "")) ||
+      (e.status === 429 && /limit:\s*0\b/i.test(e.message || "")) ||
       /not found|not supported|no longer|deprecated|retired|not available|empty answer/i.test(e.message || "");
+  }
+
+  // Errors that mean "too busy right now": wait a moment or use another model.
+  function busyProblem(e) {
+    return [429, 500, 502, 503, 504].includes(e.status) || /overloaded|high demand|unavailable|try again/i.test(e.message || "");
   }
 
   function keyProblem(e) {
@@ -390,22 +395,37 @@ ${manualAsText()}`;
     try {
       let models = await getModels(apiKey);
       const tried = new Set();
+      let listed = false;
       while (models.length) {
         const model = models.shift();
         if (tried.has(model)) continue;
         tried.add(model);
-        try {
-          const result = await callGemini(apiKey, model, body);
-          rememberModel(apiKey, model);
-          return result;
-        } catch (e) {
-          lastError = e;
-          console.warn(`[Manuel] ${model} failed:`, e.status, e.message);
-          if (keyProblem(e) || !modelProblem(e) || store.load().modelOverride) break;
-          markBad(model);
-          // The remembered model stopped working: ask Google for the current list.
-          if (!models.length && tried.size === 1) models = await getModels(apiKey);
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const result = await callGemini(apiKey, model, body);
+            rememberModel(apiKey, model);
+            return result;
+          } catch (e) {
+            lastError = e;
+            console.warn(`[Manuel] ${model} failed:`, e.status, e.message);
+            if (busyProblem(e) && !modelProblem(e) && attempt === 0 && tried.size === 1) {
+              showAnswer("Gemini is busy, trying again…");
+              await new Promise((r) => setTimeout(r, 1500));
+              continue;
+            }
+            break;
+          }
         }
+        const e = lastError;
+        if (keyProblem(e) || store.load().modelOverride || tried.size >= 3) break;
+        if (modelProblem(e)) markBad(model);
+        else if (!busyProblem(e)) break;
+        // Try other models: ask Google for the current list if we only had the remembered one.
+        if (!models.length && !listed) {
+          listed = true;
+          models = (await getModels(apiKey, { fresh: true })).filter((m) => !tried.has(m));
+        }
+        if (models.length) showAnswer("Gemini is busy, trying another model…");
       }
     } catch (e) {
       lastError = e;
@@ -416,7 +436,8 @@ ${manualAsText()}`;
     const local = localAnswer(question);
     let lead;
     if (keyProblem(e)) lead = "Your Gemini key doesn't seem to work. Please check it in settings.";
-    else if (e.status === 429) lead = "Gemini says the free limit is used up for now, so here's what I found myself.";
+    else if (e.status === 429 && /quota|limit/i.test(e.message || "")) lead = "Gemini says the free limit is used up for now, so here's what I found myself.";
+    else if (busyProblem(e)) lead = "Gemini is very busy right now, so here's what I found myself.";
     else if (e instanceof TypeError) lead = "I couldn't connect to Gemini. Please check your internet connection. Here's what I found myself.";
     else lead = "Gemini had a problem, so here's what I found myself.";
     return {
