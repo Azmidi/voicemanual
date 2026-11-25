@@ -20,6 +20,19 @@ You can also type a question in the box. Alt+M turns the mic on or off.
 Without a key, Manuel still answers by searching the manual itself.
 The key is stored only in that browser.
 
+## For a whole team: no keys needed
+
+If your organization runs the assistant server in the `proxy` folder, technicians
+don't need a key at all. Point Manuel at the server in the script line:
+
+```html
+<script src="manuel/manuel.js" data-proxy="/api/ask"></script>
+```
+
+Setup steps for IT (company server or Cloudflare): [proxy/DEPLOY.md](../proxy/DEPLOY.md).
+If the server can't be reached, Manuel uses a personal key if one is saved, and
+otherwise searches the manual itself.
+
 ## Why this version won't break when Google retires a model
 
 It doesn't use a fixed model name. It asks Google which models your key can use,

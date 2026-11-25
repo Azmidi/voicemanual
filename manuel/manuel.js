@@ -19,11 +19,20 @@
  *   your key can use, picks the newest stable "Flash" model, remembers it for a
  *   week, and automatically picks again if Google says the model is gone.
  *
- * Without an API key it still works: it searches the manual itself and reads
- * out the most relevant sentences.
+ * WHERE THE AI ANSWERS COME FROM (first one that works wins)
+ *   1. Your organization's assistant server (the "proxy" folder), if one is set
+ *      up. Technicians then need no key of their own. Point Manuel at it with
+ *        <script src="manuel/manuel.js" data-proxy="/api/ask"></script>
+ *      or set proxyUrl below.
+ *   2. A personal Gemini key typed into settings (stored in this browser only).
+ *   3. No AI at all: it searches the manual itself and reads out the most
+ *      relevant sentences. This always works, even offline.
  */
 (function () {
   "use strict";
+
+  // The <script> tag that loaded Manuel, read now because it's only known while loading.
+  const SCRIPT_TAG = document.currentScript;
 
   // ---------------------------------------------------------------------------
   // Settings you might want to change
@@ -40,7 +49,14 @@
     fallbackModel: "gemini-flash-latest", // Google's own "always current" alias, used only if listing fails
     apiBase: "https://generativelanguage.googleapis.com/v1beta",
     storageKey: "manuel_v2",
+    // Address of your organization's assistant server, for example "/api/ask" when it
+    // runs on the same server as the manual, or "https://manuel-proxy.example.workers.dev/api/ask".
+    // Leave empty to use only personal keys and the built-in manual search.
+    proxyUrl: "",
+    proxyTimeoutMs: 45000,
   };
+  // The data-proxy attribute on the script tag, or window.MANUEL_PROXY_URL, wins over the line above.
+  CONFIG.proxyUrl = (SCRIPT_TAG && SCRIPT_TAG.dataset.proxy) || window.MANUEL_PROXY_URL || CONFIG.proxyUrl;
 
   // ---------------------------------------------------------------------------
   // Saved settings (stay in this browser only)
@@ -386,9 +402,70 @@ ${manualAsText()}`;
     return (e.status === 400 && /api key|api_key/i.test(e.message || "")) || e.status === 401 || e.status === 403;
   }
 
+  // ---------------------------------------------------------------------------
+  // Your organization's assistant server (keeps the AI key off technicians' browsers)
+  // ---------------------------------------------------------------------------
+  async function askProxy(question) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), CONFIG.proxyTimeoutMs);
+    try {
+      const res = await fetch(CONFIG.proxyUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question,
+          manual: manualAsText(),
+          history: state.history.slice(-CONFIG.historyTurns),
+          name: CONFIG.name,
+        }),
+        signal: ctrl.signal,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.answer) {
+        const e = new Error(data?.error?.message || res.statusText || `HTTP ${res.status}`);
+        e.status = res.status;
+        e.code = data?.error?.code || "upstream";
+        throw e;
+      }
+      if (data.model && store.load().proxyModel !== data.model) store.save({ proxyModel: data.model });
+      return { answer: String(data.answer).trim(), sectionId: data.sectionId || "" };
+    } catch (e) {
+      if (e.name === "AbortError" || e instanceof TypeError) e.code = e.code || "offline";
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function proxyLead(e) {
+    switch (e.code) {
+      case "rate_limited": return "Lots of questions right now, so here's what I found myself. Please try again in a minute.";
+      case "quota": return "The AI usage limit is used up for now, so here's what I found myself.";
+      case "busy": return "The AI is very busy right now, so here's what I found myself.";
+      case "offline": return "I couldn't reach the assistant server, so here's what I found myself.";
+      case "not_configured": return "The assistant server isn't fully set up yet, so here's what I found myself.";
+      case "forbidden": return "This page isn't allowed to use the assistant server yet, so here's what I found myself.";
+      default: return "The assistant server had a problem, so here's what I found myself.";
+    }
+  }
+
   async function ask(question) {
     const apiKey = store.load().apiKey;
-    if (!apiKey) return localAnswer(question);
+    let proxyError = null;
+    if (CONFIG.proxyUrl) {
+      try {
+        return await askProxy(question);
+      } catch (e) {
+        proxyError = e;
+        console.warn("[Manuel] Assistant server failed:", e.code, e.status, e.message);
+      }
+    }
+    if (!apiKey) {
+      const local = localAnswer(question);
+      if (!proxyError) return local;
+      return { answer: proxyLead(proxyError) + " " + local.answer, sectionId: local.sectionId, detail: `Server said: ${proxyError.status ? proxyError.status + " " : ""}${proxyError.message}` };
+    }
+    if (proxyError) showAnswer("Trying your own Gemini key instead…");
 
     const body = buildRequest(question);
     let lastError = null;
@@ -807,7 +884,8 @@ ${manualAsText()}`;
     </div>
   </div>
   <div id="manuel-settings" hidden>
-    <label for="manuel-key">Google Gemini API key (optional)</label>
+    ${CONFIG.proxyUrl ? `<div class="m-note">AI answers come from your organization's assistant server, so you don't need a key. A personal key below is only used as a backup if that server can't be reached.</div>` : ""}
+    <label for="manuel-key">${CONFIG.proxyUrl ? "Personal Gemini API key (backup, optional)" : "Google Gemini API key (optional)"}</label>
     <input id="manuel-key" type="password" placeholder="AIza…"/>
     <div class="m-note">Without a key, ${CONFIG.name} still finds answers by searching the manual. With a key, answers are smarter. Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. The key is saved in this browser only.</div>
     <label for="manuel-model">AI model</label>
@@ -854,7 +932,8 @@ ${manualAsText()}`;
     const s = store.load();
     const note = $("manuel-model-note");
     if (!note) return;
-    if (!s.apiKey) note.textContent = "Add a key to use AI answers.";
+    if (CONFIG.proxyUrl && !s.apiKey) note.textContent = `The assistant server chooses the model${s.proxyModel ? ` (currently ${s.proxyModel})` : ""}. This setting only applies to a personal key.`;
+    else if (!s.apiKey) note.textContent = "Add a key to use AI answers.";
     else if (s.modelOverride) note.textContent = `Always using ${s.modelOverride}.`;
     else if (s.model) note.textContent = `Currently using ${s.model}, chosen automatically.`;
     else note.textContent = "A model will be chosen automatically on your first question.";
@@ -938,7 +1017,7 @@ ${manualAsText()}`;
     state.sections = readManual();
     setMode("off");
     updateModelLabel();
-    console.log(`[Manuel] Ready. Read ${state.sections.length} sections of the manual.`);
+    console.log(`[Manuel] Ready. Read ${state.sections.length} sections of the manual.${CONFIG.proxyUrl ? ` Using the assistant server at ${CONFIG.proxyUrl}.` : ""}`);
 
     // Small hook for testing from the browser console.
     window.Manuel = { ask: (q) => handle(q, { spoken: false }), sections: () => state.sections, pickBestModel };
