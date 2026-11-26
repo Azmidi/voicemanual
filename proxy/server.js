@@ -19,7 +19,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // Read KEY=value lines from .env, without overwriting settings already in the environment.
 function loadEnvFile(file) {
   if (!fs.existsSync(file)) return;
-  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+  for (const line of fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/)) {
     const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
     if (!m || line.trim().startsWith("#")) continue;
     const value = m[2].replace(/^(["'])(.*)\1$/, "$2");
