@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHandler } from "./src/core.js";
+import { getProvider } from "./src/providers/index.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -105,5 +106,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, host, () => {
   console.log(`[proxy] Listening on http://${host === "0.0.0.0" ? "localhost" : host}:${port}`);
-  console.log(`[proxy] AI provider: ${env.AI_PROVIDER || "gemini"}${staticDir ? `, serving the manual from ${staticDir}` : ""}`);
+  console.log(`[proxy] AI provider: ${getProvider(env)?.name || `unknown (${env.AI_PROVIDER})`}${staticDir ? `, serving the manual from ${staticDir}` : ""}`);
 });

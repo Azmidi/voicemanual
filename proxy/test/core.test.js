@@ -141,3 +141,53 @@ test("Cloudflare Worker entry uses the same code", async () => {
   const res = await worker.fetch(req, ENV);
   assert.equal((await res.json()).answer, "From the worker.");
 });
+
+// Company gateway: placeholder address and header names only.
+const GW = {
+  AI_PROVIDER: "company-gateway", ALLOWED_ORIGINS: ORIGIN,
+  GATEWAY_URL: "https://gateway.example.internal/chat", GATEWAY_API_KEY: "gw-key", GATEWAY_KEY_HEADER: "x-example-key",
+  GATEWAY_MODEL: "Model-A, Model-B", GATEWAY_CLIENT_HEADER: "x-example-client", GATEWAY_CLIENT_ID: "manuel",
+};
+
+test("company gateway: sends key, model and manual; reads the answer", async () => {
+  stubGoogle([[/gateway\.example\.internal/, () => ok({ status: true, msg: '{"answer":"Via gateway.","sectionId":"errors"}' })]]);
+  const res = await ask({ ...Q, history: [{ q: "Earlier?", a: "Earlier answer." }] }, { env: GW });
+  assert.deepEqual(await res.json(), { answer: "Via gateway.", sectionId: "errors", model: "Model-A" });
+  const { init } = calls[0];
+  assert.equal(init.headers["x-example-key"], "gw-key");
+  assert.equal(init.headers["x-example-client"], "manuel");
+  const sent = JSON.parse(init.body);
+  assert.equal(sent.model, "Model-A");
+  assert.match(sent.prompt, /flash checksum failure/);
+  assert.match(sent.prompt, /Technician: Earlier\?/);
+  assert.match(sent.prompt, /What does error 01\/81 mean\?/);
+  assert.equal(sent.userId, undefined);
+});
+
+test("company gateway: tries the next model when one isn't available", async () => {
+  stubGoogle([[/gateway\.example\.internal/, (u, init) => JSON.parse(init.body).model === "Model-A"
+    ? new Response(JSON.stringify({ status: false, msg: "model not found. Correlation ID: 1" }), { status: 400 })
+    : ok({ status: true, msg: "Plain text answer." })]]);
+  const body = await (await ask(Q, { env: GW })).json();
+  assert.deepEqual(body, { answer: "Plain text answer.", sectionId: "", model: "Model-B" });
+});
+
+test("company gateway: a refused or expired key is reported, not passed through", async () => {
+  stubGoogle([[/gateway\.example\.internal/, () => new Response(JSON.stringify({ status: false, msg: "Unauthorized" }), { status: 401 })]]);
+  const res = await ask(Q, { env: GW });
+  assert.equal(res.status, 502);
+  assert.equal((await res.json()).error.code, "not_configured");
+  assert.equal(calls.length, 1);
+});
+
+test("company gateway: status false with HTTP 200 is treated as an error", async () => {
+  stubGoogle([[/gateway\.example\.internal/, () => ok({ status: false, msg: "Internal error while processing the chat request." })]]);
+  const body = await (await ask(Q, { env: { ...GW, GATEWAY_MODEL: "Model-A" } })).json();
+  assert.equal(body.error.code, "upstream");
+});
+
+test("company gateway is chosen automatically when its address is set", async () => {
+  const { AI_PROVIDER, ...env } = GW;
+  const body = await (await createHandler()(new Request("https://proxy.example.com/api/health"), env)).json();
+  assert.deepEqual(body, { ok: true, provider: "company-gateway", configured: true });
+});

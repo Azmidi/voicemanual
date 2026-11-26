@@ -4,7 +4,8 @@
 
 Today each technician has to paste their own Gemini key into Manuel. This small
 server holds **one** key for everyone instead. Manuel sends the question to the
-server, the server asks Gemini, and the answer comes back. The key never reaches
+server, the server asks the AI (your company's internal AI gateway, or Gemini),
+and the answer comes back. The key never reaches
 anyone's browser. If the server can't be reached, Manuel still answers from its
 built-in manual search, and anyone who saved a personal key can still use it.
 
@@ -13,7 +14,10 @@ The same code runs in two kinds of places, with no changes:
 | Option | Good for | Cost |
 |---|---|---|
 | **A. Company server** (Node.js) | IT hosting the manual already. Manual and assistant on one server. | Your existing server |
-| **B. Cloudflare Workers** | Trying it out quickly, or if there's no company server | Free tier covers 100,000 requests a day |
+| **B. Cloudflare Workers** | Trying it out quickly with Gemini, or if there's no company server | Free tier covers 100,000 requests a day |
+
+**Using the company AI gateway? Choose option A.** An internal gateway is usually
+reachable only from inside the company network, which Cloudflare can't reach.
 
 **Can it live on the same server as the manual?** Yes. That's option A, and it's
 the simplest setup: one program serves both the manual pages and the assistant.
@@ -28,7 +32,11 @@ Elastic Beanstalk, App Runner), or in Docker.
 
 1. Copy the whole repository to the server (the manual plus this `proxy` folder).
 2. In the `proxy` folder, copy `.env.example` to a new file named `.env`.
-3. Open `.env` and paste the Gemini key after `GEMINI_API_KEY=`.
+3. Open `.env` and fill in the AI settings:
+   - **Company AI gateway:** copy the address, key header name, model id and
+     client header name from the company's GenAI API guide into the `GATEWAY_`
+     lines, and paste the key after `GATEWAY_API_KEY=`.
+   - **Gemini instead:** set `AI_PROVIDER=gemini` and paste the key after `GEMINI_API_KEY=`.
 4. Start it: `node server.js` (run from inside the `proxy` folder).
 5. Open `http://your-server:8787` and the manual appears.
 6. Tell Manuel to use the server. In `index.html`, change the script line to:
@@ -51,7 +59,7 @@ Tips for IT:
 - Docker: from the repository root, `docker build -f proxy/Dockerfile -t manuel .`
   then `docker run -p 8787:8787 -e GEMINI_API_KEY=... manuel`.
 
-## Option B: on Cloudflare Workers
+## Option B: on Cloudflare Workers (Gemini)
 
 1. Make a free Cloudflare account, and install Node.js on your own computer.
 2. In the `proxy` folder, run `npx wrangler login`.
@@ -70,7 +78,8 @@ Tips for IT:
 ## Checking that it works
 
 Open `<server address>/api/health` in a browser. You should see
-`{"ok":true,"provider":"gemini","configured":true}`. It never shows the key.
+`{"ok":true,"provider":"company-gateway","configured":true}` (or `"gemini"`).
+It never shows the key or the gateway address.
 Then ask Manuel a question. In the settings panel it now says the answers come
 from your organization's server.
 
@@ -78,9 +87,16 @@ from your organization's server.
 
 | Setting | What it does | Default |
 |---|---|---|
+| `AI_PROVIDER` | `company-gateway`, `gemini` or `azure-openai` | company-gateway if `GATEWAY_URL` is set, else gemini |
+| `GATEWAY_URL` | Company gateway: full address of its chat endpoint | (none) |
+| `GATEWAY_API_KEY` | Company gateway: the key. Keep it secret. | (none) |
+| `GATEWAY_KEY_HEADER` | Company gateway: name of the header that carries the key | (none) |
+| `GATEWAY_MODEL` | Company gateway: model id. Add backups after commas; the next is tried if one isn't available. | (none) |
+| `GATEWAY_CLIENT_HEADER`, `GATEWAY_CLIENT_ID` | Company gateway: optional app identifier header and value | (none) |
+| `GATEWAY_USER_ID` | Company gateway: optional user that usage is booked to | key owner |
+| `GATEWAY_MAX_TOKENS`, `GATEWAY_TIMEOUT_MS` | Company gateway: longest answer, and how long to wait | 1024, 45000 |
 | `GEMINI_API_KEY` | The one shared Gemini key. Keep it secret. | (none) |
 | `GEMINI_MODEL` | Always use this model. Leave empty to choose automatically, as Manuel does today. | automatic |
-| `AI_PROVIDER` | `gemini`, or `azure-openai` if the company approves that instead | `gemini` |
 | `ALLOWED_ORIGINS` | Websites allowed to use the server, comma separated. Empty = only pages on this same server. | empty |
 | `RATE_LIMIT_PER_MINUTE` | Questions per network address per minute | 30 |
 | `RATE_LIMIT_PER_DAY` | Questions per network address per day | 1000 |
@@ -101,6 +117,21 @@ not stop someone who writes their own program. For a manual used inside the
 company, the stronger protection is to put the server on the company network or
 behind the company sign-in (for example Cloudflare Access, or the portal's own
 login). Also set a monthly spending limit on the Gemini key in Google Cloud.
+
+## About the company gateway key
+
+- The gateway's address, header names and model ids are company-internal. Keep
+  them in `.env` (or the server's settings) only. This repository is public, so
+  they are deliberately not written in the code.
+- Check the guide's rules for keys before going live. Keys can be personal,
+  expire after a set time, and carry a monthly spending limit. With one key for
+  every technician, all usage counts against that one key, and when it expires
+  or hits its limit, AI answers stop for everyone (Manuel then falls back to its
+  built-in manual search). Ask the GenAI team for a key meant for a shared app,
+  and put a reminder in the calendar before it expires.
+- Each question sends the whole manual (about 20,000 tokens), so cost per
+  question depends mostly on the model. A Flash-class model keeps it low.
+- Prefer a model the guide marks as private.
 
 ## Switching AI provider later
 

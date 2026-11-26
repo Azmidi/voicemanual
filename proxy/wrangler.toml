@@ -1,4 +1,5 @@
-# Cloudflare Workers settings. Deploy with:  npx wrangler deploy
+# Cloudflare Workers settings (for Gemini; an internal company gateway usually
+# can't be reached from Cloudflare, so use server.js on a company server for that). Deploy with:  npx wrangler deploy
 # Put the key in as a secret (never in this file):  npx wrangler secret put GEMINI_API_KEY
 name = "manuel-proxy"
 main = "src/worker.js"
