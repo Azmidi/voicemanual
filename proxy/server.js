@@ -18,15 +18,17 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 // Read KEY=value lines from .env, without overwriting settings already in the environment.
 function loadEnvFile(file) {
-  if (!fs.existsSync(file)) return;
+  if (!fs.existsSync(file)) return false;
   for (const line of fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/)) {
     const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
     if (!m || line.trim().startsWith("#")) continue;
     const value = m[2].replace(/^(["'])(.*)\1$/, "$2");
     if (process.env[m[1]] === undefined) process.env[m[1]] = value;
   }
+  return true;
 }
-loadEnvFile(path.join(here, ".env"));
+// Windows Notepad often saves ".env" as ".env.txt", so accept that name too.
+const envFile = [".env", ".env.txt"].map((n) => path.join(here, n)).find(loadEnvFile) || "";
 
 const env = process.env;
 const port = Number(env.PORT || 8787);
@@ -106,5 +108,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, host, () => {
   console.log(`[proxy] Listening on http://${host === "0.0.0.0" ? "localhost" : host}:${port}`);
+  console.log(envFile ? `[proxy] Settings read from ${envFile}` : `[proxy] No settings file found. Put a file named .env in ${here}`);
   console.log(`[proxy] AI provider: ${getProvider(env)?.name || `unknown (${env.AI_PROVIDER})`}${staticDir ? `, serving the manual from ${staticDir}` : ""}`);
 });
