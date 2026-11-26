@@ -1,0 +1,13 @@
+{
+  "name": "manuel-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Keeps the AI key on the server so technicians can use Manuel without their own key.",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js",
+    "deploy:cloudflare": "npx wrangler deploy"
+  }
+}

@@ -1,0 +1,14 @@
+# Cloudflare Workers settings (for Gemini; an internal company gateway usually
+# can't be reached from Cloudflare, so use server.js on a company server for that). Deploy with:  npx wrangler deploy
+# Put the key in as a secret (never in this file):  npx wrangler secret put GEMINI_API_KEY
+name = "manuel-proxy"
+main = "src/worker.js"
+compatibility_date = "2024-11-01"
+
+[vars]
+AI_PROVIDER = "gemini"
+# The website(s) where the manual is published, comma separated. Required on Workers,
+# because the manual is on a different address than the worker.
+ALLOWED_ORIGINS = "https://manual.example.com"
+RATE_LIMIT_PER_MINUTE = "30"
+RATE_LIMIT_PER_DAY = "1000"
